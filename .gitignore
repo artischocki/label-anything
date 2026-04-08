@@ -1,0 +1,7 @@
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.venv/
+.pkgdeps/
+.docker-certs/host-extra-ca.crt

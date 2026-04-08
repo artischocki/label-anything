@@ -1,0 +1,162 @@
+#!/usr/bin/env bash
+
+set -euo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+IMAGE_NAME="${LABEL_ANYTHING_IMAGE:-label-anything}"
+USE_GPU="auto"
+REBUILD=0
+CERT_DIR="$SCRIPT_DIR/.docker-certs"
+CERT_BUNDLE="$CERT_DIR/host-extra-ca.crt"
+
+usage() {
+    cat <<'EOF'
+Usage: ./run [--rebuild] [--cpu] /path/to/images [label-anything args...]
+
+Examples:
+  ./run /path/to/images
+  ./run --rebuild /path/to/images --sam-model large
+  ./run --cpu /path/to/images --rgb-to-bgr
+EOF
+}
+
+compute_build_stamp() {
+    python3 - "$SCRIPT_DIR" <<'PY'
+from __future__ import annotations
+
+import hashlib
+import sys
+from pathlib import Path
+
+root = Path(sys.argv[1])
+paths: list[Path] = []
+for relative in ("Dockerfile", ".dockerignore", "pyproject.toml", "README.md", "run"):
+    path = root / relative
+    if path.exists():
+        paths.append(path)
+
+src_root = root / "src"
+if src_root.exists():
+    paths.extend(sorted(path for path in src_root.rglob("*") if path.is_file()))
+
+cert_root = root / ".docker-certs"
+if cert_root.exists():
+    paths.extend(sorted(path for path in cert_root.rglob("*") if path.is_file()))
+
+digest = hashlib.sha256()
+for path in sorted(paths):
+    digest.update(str(path.relative_to(root)).encode())
+    digest.update(b"\0")
+    digest.update(path.read_bytes())
+    digest.update(b"\0")
+
+print(digest.hexdigest())
+PY
+}
+
+while (($# > 0)); do
+    case "$1" in
+        --rebuild)
+            REBUILD=1
+            shift
+            ;;
+        --cpu)
+            USE_GPU="no"
+            shift
+            ;;
+        -h|--help)
+            usage
+            exit 0
+            ;;
+        --)
+            shift
+            break
+            ;;
+        -*)
+            echo "Unknown launcher option: $1" >&2
+            usage
+            exit 1
+            ;;
+        *)
+            break
+            ;;
+    esac
+done
+
+if (($# == 0)); then
+    usage
+    exit 1
+fi
+
+HOST_TASKS_DIR="$(
+    python3 -c 'from pathlib import Path; import sys; print(Path(sys.argv[1]).expanduser().resolve())' "$1"
+)"
+shift
+
+if [[ ! -d "$HOST_TASKS_DIR" ]]; then
+    echo "Image directory does not exist: $HOST_TASKS_DIR" >&2
+    exit 1
+fi
+
+if [[ "$REBUILD" -eq 1 ]] || ! docker image inspect "$IMAGE_NAME" >/dev/null 2>&1; then
+    mkdir -p "$CERT_DIR"
+    rm -f "$CERT_BUNDLE"
+
+    EXTRA_CA_FILE="${LABEL_ANYTHING_EXTRA_CA_FILE:-}"
+    if [[ -n "$EXTRA_CA_FILE" ]]; then
+        cp "$EXTRA_CA_FILE" "$CERT_BUNDLE"
+    elif [[ -d /usr/local/share/ca-certificates ]]; then
+        mapfile -d '' EXTRA_CA_FILES < <(find /usr/local/share/ca-certificates -type f \( -name '*.crt' -o -name '*.pem' \) -print0)
+        if ((${#EXTRA_CA_FILES[@]} > 0)); then
+            cat "${EXTRA_CA_FILES[@]}" > "$CERT_BUNDLE"
+        fi
+    fi
+
+    CURRENT_BUILD_STAMP="$(compute_build_stamp)"
+    docker build --build-arg "BUILD_STAMP=$CURRENT_BUILD_STAMP" -t "$IMAGE_NAME" "$SCRIPT_DIR"
+else
+    mkdir -p "$CERT_DIR"
+    rm -f "$CERT_BUNDLE"
+
+    EXTRA_CA_FILE="${LABEL_ANYTHING_EXTRA_CA_FILE:-}"
+    if [[ -n "$EXTRA_CA_FILE" ]]; then
+        cp "$EXTRA_CA_FILE" "$CERT_BUNDLE"
+    elif [[ -d /usr/local/share/ca-certificates ]]; then
+        mapfile -d '' EXTRA_CA_FILES < <(find /usr/local/share/ca-certificates -type f \( -name '*.crt' -o -name '*.pem' \) -print0)
+        if ((${#EXTRA_CA_FILES[@]} > 0)); then
+            cat "${EXTRA_CA_FILES[@]}" > "$CERT_BUNDLE"
+        fi
+    fi
+
+    CURRENT_BUILD_STAMP="$(compute_build_stamp)"
+    EXISTING_BUILD_STAMP="$(docker image inspect --format '{{index .Config.Labels "org.label_anything.build"}}' "$IMAGE_NAME" 2>/dev/null || true)"
+    if [[ "$CURRENT_BUILD_STAMP" != "$EXISTING_BUILD_STAMP" ]]; then
+        docker build --build-arg "BUILD_STAMP=$CURRENT_BUILD_STAMP" -t "$IMAGE_NAME" "$SCRIPT_DIR"
+    fi
+fi
+
+DOCKER_ARGS=(
+    --rm
+    --network=host
+    -e "DISPLAY=${DISPLAY:-:0}"
+    -v /tmp/.X11-unix:/tmp/.X11-unix:rw
+    -v "$HOST_TASKS_DIR:/work/input"
+)
+
+if [[ -t 0 && -t 1 ]]; then
+    DOCKER_ARGS+=(-it)
+else
+    DOCKER_ARGS+=(-i)
+fi
+
+XAUTH_FILE="${XAUTHORITY:-$HOME/.Xauthority}"
+if [[ -f "$XAUTH_FILE" ]]; then
+    DOCKER_ARGS+=(-e "XAUTHORITY=/root/.Xauthority")
+    DOCKER_ARGS+=(-v "$XAUTH_FILE:/root/.Xauthority:ro")
+fi
+
+if [[ "$USE_GPU" != "no" ]] && command -v nvidia-smi >/dev/null 2>&1; then
+    DOCKER_ARGS+=(--gpus all)
+fi
+
+exec docker run "${DOCKER_ARGS[@]}" "$IMAGE_NAME" /work/input "$@"

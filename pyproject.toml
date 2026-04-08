@@ -1,0 +1,22 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "label-anything"
+version = "0.1.0"
+description = "Tkinter-based image mask labeling with SAM 2."
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = [
+    "numpy>=1.26",
+    "opencv-python>=4.10",
+    "pillow>=10.4",
+    "torch>=2.5",
+]
+
+[project.scripts]
+label-anything = "label_anything.cli:main"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/label_anything"]
