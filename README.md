@@ -1,4 +1,4 @@
-# label_anything
+# label-anything
 
 ## Prerequisites
 You will need WSL installed to run this!
